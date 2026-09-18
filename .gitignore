@@ -323,3 +323,534 @@ writer = cv2.VideoWriter(args.save, cv2.VideoWriter_fourcc(*"mp4v"), 30, (w, h))
 writer.write(frame)
 continue
 xyxy = boxes.xyxy.cpu().numpy()
+confs = boxes.conf.cpu().numpy()
+ids = boxes.id.cpu().numpy() if boxes.id is not None else np.array([-1] * len(xyxy))
+keep = []
+for (x1, y1, x2, y2), s, tid in zip(xyxy, confs, ids):
+if s < args.conf:
+continue
+w_box = max(1.0, x2 - x1)
+h_box = max(1.0, y2 - y1)
+if h_box < args.min_h:
+continue
+if (h_box / w_box) < args.min_ar:
+continue
+keep.append((int(x1), int(y1), int(x2), int(y2), float(s), int(tid)))
+if writer is None:
+writer = cv2.VideoWriter(args.save, cv2.VideoWriter_fourcc(*"mp4v"), 30, (w, h))
+for x1, y1, x2, y2, s, tid in keep:
+cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+label = f"ID {tid if tid >= 0 else 0} {s:.2f}"
+cv2.putText(frame, label, (x1, max(0, y1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 
+0), 2)
+writer.write(frame)
+if writer is not None:
+writer.release()
+print(f"Saved tracked output to: {args.save}")
+if name == "main":
+main()
+infer_track.py:
+import argparse
+from pathlib import Path
+import cv2
+import numpy as np
+from ultralytics import YOLO
+# Simple IOU-based tracker for consistent IDs
+class SimpleTracker:
+def __init__(self, iou_thresh=0.3, max_missing=30):
+self.tracks = {} # id -> {bbox, missing}
+self.next_id = 1
+self.iou_thresh = iou_thresh
+self.max_missing = max_missing
+@staticmethod
+def iou(a, b):
+ax1, ay1, ax2, ay2 = a
+bx1, by1, bx2, by2 = b
+inter_x1 = max(ax1, bx1)
+inter_y1 = max(ay1, by1)
+inter_x2 = min(ax2, bx2)
+inter_y2 = min(ay2, by2)
+if inter_x2 <= inter_x1 or inter_y2 <= inter_y1:
+return 0.0
+inter = (inter_x2 - inter_x1) * (inter_y2 - inter_y1)
+area_a = (ax2 - ax1) * (ay2 - ay1)
+area_b = (bx2 - bx1) * (by2 - by1)
+return inter / (area_a + area_b - inter + 1e-6) 
+def update(self, detections):
+# detections: list of (x1,y1,x2,y2,score)
+assigned = {}
+det_used = set()
+# Greedy assignment by IOU
+for tid, t in list(self.tracks.items()):
+best_iou, best_j = 0.0, None
+for j, d in enumerate(detections):
+if j in det_used:
+continue
+i = self.iou(t["bbox"], d[:4])
+if i > best_iou:
+best_iou, best_j = i, j
+if best_j is not None and best_iou >= self.iou_thresh:
+self.tracks[tid] = {"bbox": detections[best_j][:4], "missing": 0}
+det_used.add(best_j)
+assigned[tid] = detections[best_j]
+else:
+self.tracks[tid]["missing"] += 1
+if self.tracks[tid]["missing"] > self.max_missing:
+del self.tracks[tid]
+# Create new tracks for unmatched detections
+for j, d in enumerate(detections):
+if j in det_used:
+continue
+tid = self.next_id
+self.next_id += 1
+self.tracks[tid] = {"bbox": d[:4], "missing": 0}
+assigned[tid] = d
+return assigned 
+def filter_detections(boxes, confs, img_h, img_w, conf_thresh=0.28, min_h=30, min_ar=1.5):
+out = []
+for b, s in zip(boxes, confs):
+if s < conf_thresh:
+continue
+x1, y1, x2, y2 = map(float, b)
+w = max(1.0, x2 - x1)
+h = max(1.0, y2 - y1)
+# height threshold
+if h < min_h:
+continue
+# aspect ratio height/width
+ar = h / w
+if ar < min_ar:
+continue
+# clip to image bounds
+x1 = max(0, min(img_w - 1, x1))
+y1 = max(0, min(img_h - 1, y1))
+x2 = max(0, min(img_w - 1, x2))
+y2 = max(0, min(img_h - 1, y2))
+out.append((x1, y1, x2, y2, s))
+return out
+def main():
+parser = argparse.ArgumentParser(description="YOLOv8 person detect+track with filtering")
+parser.add_argument("--weights", type=str, required=True, help="Path to trained weights .pt")
+parser.add_argument("--source", type=str, required=True, help="Video file or camera index")
+parser.add_argument("--conf", type=float, default=0.28, help="Confidence threshold")
+parser.add_argument("--min_h", type=int, default=30, help="Min box height (px)")
+parser.add_argument("--min_ar", type=float, default=1.5, help="Min height/width aspect 
+ratio") 
+parser.add_argument("--save", type=str, default="outputs/tracked.mp4", help="Output video 
+path")
+args = parser.parse_args()
+model = YOLO(args.weights)
+# Open source
+cap = cv2.VideoCapture(0 if args.source == "0" else args.source)
+if not cap.isOpened():
+raise RuntimeError(f"Failed to open source: {args.source}")
+Path(args.save).parent.mkdir(parents=True, exist_ok=True)
+fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+fps = cap.get(cv2.CAP_PROP_FPS) or 30
+w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+writer = cv2.VideoWriter(args.save, fourcc, fps, (w, h))
+tracker = SimpleTracker(iou_thresh=0.35, max_missing=20)
+while True:
+ret, frame = cap.read()
+if not ret:
+break
+# Predict persons only
+results = model.predict(frame, classes=[0], conf=args.conf, imgsz=IMGSZ := 960, 
+verbose=False)
+res = results[0]
+boxes_xyxy = res.boxes.xyxy.cpu().numpy() if res.boxes is not None else np.empty((0, 4))
+confs = res.boxes.conf.cpu().numpy() if res.boxes is not None else np.empty((0,)) 
+dets = filter_detections(boxes_xyxy, confs, frame.shape[0], frame.shape[1], args.conf, 
+args.min_h, args.min_ar)
+assigned = tracker.update(dets)
+# Draw
+for tid, d in assigned.items():
+x1, y1, x2, y2, s = d
+p1 = (int(x1), int(y1))
+p2 = (int(x2), int(y2))
+cv2.rectangle(frame, p1, p2, (0, 255, 0), 2)
+cv2.putText(frame, f"ID {tid} {s:.2f}", (p1[0], max(0, p1[1]-5)), 
+cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+writer.write(frame)
+# Optional preview: comment out for non-interactive
+# cv2.imshow("tracked", frame)
+2. # if cv2.waitKey(1) & 0xFF == ord('q'): Dataset preparation 
+pipeline
+2. Dataset preparation pipeline
+# break
+cap.release()
+writer.release()
+print(f"Saved tracked output to: {args.save}")
+if __name__ == "__main__":
+main()
+eval_counting.py:
+import argparse
+import os
+from typing import List, Tuple, Dict
+import cv2
+import numpy as np
+import yaml
+from ultralytics import YOLO
+from scipy.optimize import linear_sum_assignment
+def load_yaml(path: str) -> Dict:
+with open(path, "r", encoding="utf-8") as f:
+return yaml.safe_load(f)
+def yolo_txt_to_xyxy(txt_path: str, img_w: int, img_h: int) -> np.ndarray:
+boxes = []
+if not os.path.isfile(txt_path):
+return np.zeros((0, 4), dtype=np.float32)
+with open(txt_path, "r", encoding="utf-8") as f:
+for line in f:
+parts = line.strip().split()
+if len(parts) < 5:
+continue
+# YOLO: class cx cy w h (normalized)
+cls = int(float(parts[0]))
+if cls != 0:
+continue
+cx, cy, w, h = map(float, parts[1:5])
+x1 = (cx - w / 2) * img_w
+y1 = (cy - h / 2) * img_h
+x2 = (cx + w / 2) * img_w
+y2 = (cy + h / 2) * img_h 
+boxes.append([x1, y1, x2, y2])
+if not boxes:
+return np.zeros((0, 4), dtype=np.float32)
+return np.array(boxes, dtype=np.float32)
+def iou_matrix(boxes1: np.ndarray, boxes2: np.ndarray) -> np.ndarray:
+# boxes shape: (N,4) with xyxy
+if boxes1.size == 0 or boxes2.size == 0:
+return np.zeros((boxes1.shape[0], boxes2.shape[0]), dtype=np.float32)
+x11, y11, x12, y12 = np.split(boxes1, 4, axis=1)
+x21, y21, x22, y22 = np.split(boxes2, 4, axis=1)
+inter_x1 = np.maximum(x11, x21.T)
+inter_y1 = np.maximum(y11, y21.T)
+inter_x2 = np.minimum(x12, x22.T)
+inter_y2 = np.minimum(y12, y22.T)
+inter_w = np.clip(inter_x2 - inter_x1, a_min=0, a_max=None)
+inter_h = np.clip(inter_y2 - inter_y1, a_min=0, a_max=None)
+inter = inter_w * inter_h
+area1 = (x12 - x11) * (y12 - y11)
+area2 = (x22 - x21) * (y22 - y21)
+union = area1 + area2.T - inter
+iou = np.where(union > 0, inter / union, 0.0)
+return iou.astype(np.float32)
+def match_boxes(pred: np.ndarray, gt: np.ndarray, iou_thr: float) -> Tuple[int, List[int], 
+List[int]]:
+# Returns: num_matches, unmatched_pred_idx, unmatched_gt_idx
+if pred.size == 0 or gt.size == 0:
+return 0, list(range(pred.shape[0])), list(range(gt.shape[0])) 
+ious = iou_matrix(pred, gt)
+# Hungarian on cost = 1 - IoU
+cost = 1.0 - ious
+row_ind, col_ind = linear_sum_assignment(cost)
+matches = 0
+used_pred = set()
+used_gt = set()
+for r, c in zip(row_ind, col_ind):
+if ious[r, c] >= iou_thr:
+matches += 1
+used_pred.add(r)
+used_gt.add(c)
+unmatched_pred = [i for i in range(pred.shape[0]) if i not in used_pred]
+unmatched_gt = [j for j in range(gt.shape[0]) if j not in used_gt]
+return matches, unmatched_pred, unmatched_gt
+def valid_pred_boxes(result, conf_thr: float, min_h: int = 0, min_ar: float = 0.0) -> np.ndarray:
+boxes = result.boxes
+if boxes is None or len(boxes) == 0:
+return np.zeros((0, 4), dtype=np.float32)
+xyxy = boxes.xyxy.cpu().numpy()
+conf = boxes.conf.cpu().numpy()
+cls = boxes.cls.cpu().numpy() if boxes.cls is not None else np.zeros_like(conf)
+keep = (conf >= conf_thr) & (cls == 0)
+xyxy = xyxy[keep]
+if xyxy.size == 0:
+return np.zeros((0, 4), dtype=np.float32)
+if min_h > 0 or min_ar > 0:
+w = xyxy[:, 2] - xyxy[:, 0]
+h = xyxy[:, 3] - xyxy[:, 1]
+ar = np.divide(h, np.maximum(w, 1e-6)) USHA RAMA COLLEGE OF ENGINEERING AND TECHNOLOGY DEPARTMENT OFAI 44
+keep2 = np.ones(xyxy.shape[0], dtype=bool)
+if min_h > 0:
+keep2 &= h >= min_h
+if min_ar > 0:
+keep2 &= ar >= min_ar
+xyxy = xyxy[keep2]
+return xyxy.astype(np.float32)
+def main():
+ap = argparse.ArgumentParser(description="Evaluate person detection & counting accuracy")
+ap.add_argument("--weights", required=True, help="Path to YOLO weights (e.g., best.pt)")
+ap.add_argument("--data", required=True, help="data.yaml path")
+ap.add_argument("--split", default="val", choices=["train", "val", "test"], help="Dataset split")
+ap.add_argument("--conf", type=float, default=0.25)
+ap.add_argument("--iou_match", type=float, default=0.5, help="IoU threshold for matching")
+ap.add_argument("--min_h", type=int, default=0)
+ap.add_argument("--min_ar", type=float, default=0.0)
+ap.add_argument("--max", type=int, default=0, help="Max images to evaluate (0=all)")
+args = ap.parse_args()
+cfg = load_yaml(args.data)
+base = cfg.get("path", "")
+img_rel = cfg.get(args.split, "")
+if not base or not img_rel:
+raise SystemExit("Invalid data.yaml: must contain 'path' and split entry")
+img_dir = img_rel if os.path.isabs(img_rel) else os.path.join(base, img_rel)
+lbl_dir = img_dir.replace("/images", "/labels").replace("\\images", "\\labels")
+model = YOLO(args.weights)
+# Gather image-label pairs
+images = []
+for root, _, files in os.walk(img_dir):
+for fn in files:
+if fn.lower().endswith((".jpg", ".jpeg", ".png")):
+ip = os.path.join(root, fn)
+ln = os.path.splitext(fn)[0] + ".txt"
+lp = os.path.join(lbl_dir, ln)
+images.append((ip, lp))
+images.sort()
+if args.max and args.max > 0:
+images = images[: args.max]
+# Metrics accumulators
+abs_errors = []
+abs_pct_errors = []
+total_abs_error = 0
+total_gt = 0
+exact_match = 0
+tp_total = 0
+fp_total = 0
+fn_total = 0
+for ip, lp in images:
+img = cv2.imread(ip)
+if img is None:
+continue
+h, w = img.shape[:2]
+gt = yolo_txt_to_xyxy(lp, w, h)
+pred_res = model.predict(img[:, :, ::-1], imgsz=960, conf=args.conf, verbose=False)[0]
+pred = valid_pred_boxes(pred_res, args.conf, args.min_h, args.min_ar)
+gt_count = gt.shape[0]
+pred_count = pred.shape[0]
+# Matching for detection stats
+matches, unp, ung = match_boxes(pred, gt, args.iou_match)
+tp = matches
+fp = len(unp)
+fn = len(ung)
+tp_total += tp
+fp_total += fp
+fn_total += fn
+# Counting metrics
+err = pred_count - gt_count
+abs_err = abs(err)
+abs_errors.append(abs_err)
+total_abs_error += abs_err
+total_gt += gt_count
+if gt_count > 0:
+abs_pct_errors.append(abs_err / gt_count)
+exact_match += int(pred_count == gt_count)
+n = max(len(images), 1)
+mae = float(np.mean(abs_errors)) if abs_errors else 0.0
+mape = float(np.mean(abs_pct_errors)) * 100.0 if abs_pct_errors else 0.0
+wape = (total_abs_error / max(total_gt, 1)) * 100.0
+exact_acc = (exact_match / n) * 100.0
+precision = tp_total / max(tp_total + fp_total, 1)
+recall = tp_total / max(tp_total + fn_total, 1)
+f1 = (2 * precision * recall / max(precision + recall, 1e-6)) if (precision + recall) > 0 else 0.0
+print("=== Detection & Counting Metrics ===")
+print(f"Images evaluated: {n}")
+print(f"Detection precision: {precision:.3f}")
+print(f"Detection recall: {recall:.3f}")
+print(f"F1 score: {f1:.3f}")
+print("--- Counting (persons/image) ---")
+print(f"MAE: {mae:.3f}")
+print(f"MAPE: {mape:.2f}%")
+print(f"WAPE: {wape:.2f}%")
+print(f"Exact count accuracy (images): {exact_acc:.2f}%")
+if __name__ == "__main__":
+main()
+app.py:
+import io
+import os
+import sys
+import tempfile
+from typing import Optional
+import cv2
+import numpy as np
+import pandas as pd
+import streamlit as st
+from ultralytics import YOLO
+# Support running via `streamlit run person_yolo/web/app.py` (no package context)
+try:
+from .utils import (
+analyze_image,
+load_model,
+track_video_collect,
+render_selected_track_video,
+)
+except Exception:
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir, os.pardir))
+if ROOT not in sys.path:
+sys.path.insert(0, ROOT)
+from person_yolo.web.utils import (
+analyze_image,
+load_model,
+track_video_collect,
+render_selected_track_video,
+)
+@st.cache_resource(show_spinner=False)
+def _load_model(weights: Optional[str] = None) -> YOLO:
+return load_model(weights)
+def to_rgb(img_bgr: np.ndarray) -> np.ndarray:
+return cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+def heatmap_to_rgb(heat: np.ndarray) -> np.ndarray:
+heat_uint8 = (np.clip(heat, 0, 1) * 255).astype(np.uint8)
+colored = cv2.applyColorMap(heat_uint8, cv2.COLORMAP_JET)
+return cv2.cvtColor(colored, cv2.COLOR_BGR2RGB)
+def inject_css():
+st.markdown(
+"""
+<style>
+.stApp { background: #0b1220; color: #e5e7eb; }
+[data-testid="stSidebar"] { background: #0d1325; }
+/* Sidebar nav buttons */
+[data-testid="stSidebar"] .stButton > button {
+width: 100%;
+background: #1f2937;
+color: #e5e7eb;
+border: 1px solid #374151;
+border-radius: 10px;
+padding: 8px 12px;
+font-weight: 600;
+height: 44px;
+display: inline-flex;
+align-items: center;
+justify-content: center;
+}
+[data-testid="stSidebar"] .stButton > button:hover { background: #273244; border-color: 
+#4b5563; }
+.nav-spacer { height: 8px; }
+.hero {
+margin: 1rem 0 2rem 0; padding: 1.5rem 2rem; border-radius: 20px;
+background: linear-gradient(90deg, #FF6B6B, #4ECDC4);
+color: #ffffff; font-weight: 800; font-size: 2rem; text-align:center;
+box-shadow: 0 12px 32px rgba(0,0,0,0.30);
+}
+.divider { border-bottom: 1px solid #1f2937; margin: 1rem 0 1.5rem 0; }
+.card-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1.5rem; 
+align-items: stretch; }
+.card {
+border-radius: 16px; padding: 1.1rem 1.4rem; color: #0b1220;
+box-shadow: 0 10px 28px rgba(0,0,0,0.28);
+} USHA RAMA COLLEGE OF ENGINEERING AND TECHNOLOGY DEPARTMENT OFAI 50
+.card.image { background: linear-gradient(135deg,#667eea 0%, #764ba2 100%); }
+.card.video { background: linear-gradient(135deg,#FF6B6B 0%, #FFE66D 100%); }
+.card h3 { margin: 0 0 .5rem 0; font-weight: 800; }
+.card .subtitle { margin:.25rem 0 1rem 0; color:#0b1220; opacity:.8; }
+.card ul { margin: .5rem 0 0 1rem; }
+.card ul li { margin:.35rem 0; }
+.badge { display:inline-flex; align-items:center; gap:.5rem; font-weight:800; color:#0b1220; 
+}
+.badge .icon { font-size:1.35rem; }
+.section { background:#0f172a; border-radius:12px; padding:1rem; margin-top:1rem; }
+.metric-row { display:grid; grid-template-columns: 2fr 1fr; gap:1rem; }
+.thumb-grid { display:grid; grid-template-columns: repeat(4, minmax(0,1fr)); gap:.75rem; }
+</style>
+""",
+unsafe_allow_html=True,
+)
+def feature_cards():
+st.markdown('<div class="card-grid">', unsafe_allow_html=True)
+st.markdown(
+"""
+<div class="card image">
+<div class="badge"><span class="icon">🖼️</span><span>IMAGE 
+ANALYSIS</span></div>
+<div class="subtitle">Upload a single image and get instant analysis:</div>
+<ul>
+<li>• 👤 Person Detection</li>
+<li>• 📊 Crowd Density Estimation</li>
+</ul>
+</div>
+""", 
+unsafe_allow_html=True,
+)
+st.markdown(
+"""
+<div class="card video">
+<div class="badge"><span class="icon">🎬</span><span>VIDEO 
+ANALYSIS</span></div>
+<div class="subtitle">Upload a video for comprehensive analysis:</div>
+<ul>
+<li>• ⏱️ Real-time Detection</li>
+<li>• 📈 Crowd Density Over Time</li>
+<li>• 🆔 Person Tracking (select-one highlight)</li>
+</ul>
+</div>
+""",
+unsafe_allow_html=True,
+)
+st.markdown('</div>', unsafe_allow_html=True)
+def main():
+st.set_page_config(page_title="SDS Dashboard", layout="wide")
+inject_css()
+def set_page(p):
+st.session_state["page"] = p
+def nav_button(label: str, icon: str = ""):
+if st.button(f"{icon} {label}", key=f"nav_{label}"):
+set_page(label)
+st.markdown('<div class="nav-spacer"></div>', unsafe_allow_html=True) 
+with st.sidebar:
+st.markdown("## SDS Dashboard")
+if "page" not in st.session_state:
+st.session_state["page"] = "Home"
+nav_button("Home", "🏠")
+nav_button("Image Analysis", "🖼️")
+nav_button("Video Analysis", "🎬")
+st.divider()
+st.markdown("### Settings")
+conf = st.slider("Confidence", 0.05, 0.9, 0.25, 0.01)
+# Default to the current 50-epoch run's best.pt; fallback happens inside _load_model if not 
+found yet
+default_weights = "v:/SSD/runs/detect/yolo_person_wider_mot_50/weights/best.pt"
+weights = st.text_input("Weights (optional)", value=default_weights)
+model = _load_model(weights if weights.strip() else None)
+st.success("Model ready")
+st.markdown('<div class="hero">👥 SDS – Smart Detection & Surveillance</div>', 
+unsafe_allow_html=True)
+st.markdown("Welcome to the SDS Crowd Analysis Dashboard.")
+st.caption("This system provides real-time analysis of crowds and individuals in images and 
+videos.")
+st.markdown('<div class="divider"></div>', unsafe_allow_html=True)
+# Current page from session
+page_norm = st.session_state.get("page", "Home")
+if page_norm == "Home":
+feature_cards()
+# Key features and getting started
+st.markdown("#### Key Features")
+st.markdown("- Fast person-only detection and density visualization")
+st.markdown("- Video tracking with selectable person highlight")
+st.markdown("- Simple, GPU-accelerated pipeline with YOLOv8 + ByteTrack")
+st.markdown("#### Getting Started")
+st.markdown("- Upload an image or video from the sidebar tabs")
+st.markdown("- Adjust confidence threshold in Settings")
+st.markdown("- Optionally provide a custom weights path")
+elif page_norm == "Image Analysis":
+st.markdown("### Image Analysis")
+with st.container():
+st.markdown("#### Detection Controls")
+show_all = st.checkbox("Show all detections", value=True, help="Bypass strict filters to 
+reveal small/distant people.")
+colc1, colc2, colc3 = st.columns([1, 1, 1])
+with colc1:
+min_h = 0
+with colc2:
+min_ar = st.slider("Min aspect ratio (h/w)", 0.0, 3.0, 0.0 if show_all else 0.8, 0.05)
+with colc3:
+max_det = st.slider("Max detections", 50, 1000, 500, 50)
+up = st.file_uploader("Upload image", type=["jpg", "jpeg", "png"])
+if up is not None:
+data = up.read()
+img_array = np.frombuffer(data, dtype=np.uint8)
+bgr = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+conf_eff = 0.12 if show_all else conf
+res = analyze_image(
+model, bgr, conf=conf_eff, min_height=int(min_h), min_aspect_ratio=float(min_ar), 
+max_det=int(max_det)
+)
