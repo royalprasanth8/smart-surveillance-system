@@ -1,2 +1,81 @@
-# Google App Engine generated folder
-appengine-generated/
+import os
+import shutil
+from pathlib import Path
+from typing import List, Tuple
+import cv2
+def to_yolo_line(x1: float, y1: float, x2: float, y2: float, w: int, h: int) -> str:
+x1 = max(0.0, min(x1, w - 1))
+x2 = max(0.0, min(x2, w - 1))
+y1 = max(0.0, min(y1, h - 1))
+y2 = max(0.0, min(y2, h - 1))
+cx = (x1 + x2) / 2.0 / w
+cy = (y1 + y2) / 2.0 / h
+bw = (x2 - x1) / w
+bh = (y2 - y1) / h
+return f"0 {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}"
+def convert_split(ids_file, images_dir, annos_dir, out_images, out_labels):
+out_images.mkdir(parents=True, exist_ok=True)
+out_labels.mkdir(parents=True, exist_ok=True)
+total = 0
+with ids_file.open("r", encoding="utf-8") as f:
+ids = [ln.strip() for ln in f.readlines() if ln.strip()]
+for img_id in ids:
+img_name = f"{img_id}.jpg"
+src_img = images_dir / img_name
+src_anno = annos_dir / f"{img_name}.txt"
+if not src_img.exists():
+continue
+img = cv2.imread(str(src_img))
+if img is None:
+continue
+h, w = img.shape[:2]
+boxes = read_wider_annotation(src_anno)
+yolo_lines = []
+for cls, x1, y1, x2, y2 in boxes:
+if cls not in (1, 3):
+continue
+line = to_yolo_line(x1, y1, x2, y2, w, h)
+yolo_lines.append(line)
+shutil.copy2(src_img, out_images / img_name)
+dst_lbl = out_labels / (Path(img_name).stem + ".txt")
+with dst_lbl.open("w", encoding="utf-8") as f:
+if yolo_lines:
+f.write("\n".join(yolo_lines))
+total += 1
+return total
+Prepare_dataset.py
+import shutil
+from pathlib import Path
+from typing import List, Tuple
+IMG_EXTS = {".jpg", ".jpeg", ".png"}
+def gather_yolo_pairs(images_dir: Path, labels_dir: Path) -> List[Tuple[Path, Path]]: USHA RAMA COLLEGE OF ENGINEERING AND TECHNOLOGY DEPARTMENT OFAI 25
+pairs: List[Tuple[Path, Path]] = []
+if not images_dir or not images_dir.exists():
+return pairs
+for img in images_dir.rglob("*"):
+if img.is_file() and img.suffix.lower() in IMG_EXTS:
+lbl = labels_dir / (img.stem + ".txt") if labels_dir else None
+pairs.append((img, lbl if (lbl and lbl.exists()) else None))
+return pairs
+def copy_item(src_img: Path, src_lbl: Path | None, dst_img_root: Path, dst_lbl_root: Path) -> 
+None:
+dst_img_root.mkdir(parents=True, exist_ok=True)
+dst_lbl_root.mkdir(parents=True, exist_ok=True)
+# Flatten filename to avoid nested dirs
+dst_img = dst_img_root / src_img.name
+shutil.copy2(src_img, dst_img)
+dst_lbl = dst_lbl_root / (src_img.stem + ".txt")
+if src_lbl and src_lbl.exists():
+shutil.copy2(src_lbl, dst_lbl)
+else:
+# create empty for negatives
+dst_lbl.write_text("")
+def merge_sources(sources: List[Tuple[Path, Path]], negatives: Path | None, out_root: Path, 
+val_ratio: float = 0.1) -> None:
+"""
+sources: list of (images_dir, labels_dir) in YOLO layout
+negatives: dir of images without labels (optional)
+Creates `train/images, train/labels, val/images, val/labels` under out_root.
+"""
+out_train_img = out_root / "train" / "images"
+
